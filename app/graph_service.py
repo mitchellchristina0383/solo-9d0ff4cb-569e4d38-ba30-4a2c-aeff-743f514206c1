@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from collections import deque
 
+from .availability import record_conclusion
 from .database import read_tx, write_tx
 from .errors import GraphError, NoGraph
 from .schemas import GraphPayload, GraphResponse, ServiceIn
@@ -135,6 +136,11 @@ def replace_graph(payload: GraphPayload) -> dict:
                 nodes,
             )
         ]
+
+        # A graph swap can change the entry's upstream closure (services added
+        # or removed), so re-derive the availability conclusion in the same
+        # transaction.  Only an actual change creates a new segment.
+        record_conclusion(conn)
     return {
         "accepted": True,
         "revision": new_revision,

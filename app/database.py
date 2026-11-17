@@ -59,6 +59,32 @@ CREATE TABLE IF NOT EXISTS events (
     applied         INTEGER NOT NULL,
     recorded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Entry-availability monitoring.  There is at most one monitor (id = 1).
+-- ``stopped_at`` is NULL while the monitor is active; once stopped, the
+-- finalized timeline is retained and later reports only update service state.
+CREATE TABLE IF NOT EXISTS availability_monitor (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    entry           TEXT NOT NULL,
+    start_revision  INTEGER NOT NULL,
+    started_at      TEXT NOT NULL,
+    stopped_at      TEXT
+);
+
+-- Conclusions over time.  A new row is appended only when a committed change
+-- flips the conclusion; every row except (possibly) the newest is closed, and
+-- consecutive rows are contiguous.  Timestamps are UTC with millisecond
+-- precision so that duration arithmetic is exact.
+CREATE TABLE IF NOT EXISTS availability_segment (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_at        TEXT NOT NULL,
+    end_at          TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('available', 'interrupted', 'unknown')),
+    graph_revision  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS availability_segment_start
+    ON availability_segment (start_at, id);
 """
 
 _local = threading.local()
@@ -87,8 +113,19 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     finally:
         close_connection()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first release, idempotently."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(availability_monitor)")
+    }
+    if "stopped_at" not in columns:
+        conn.execute("ALTER TABLE availability_monitor ADD COLUMN stopped_at TEXT")
 
 
 @contextmanager

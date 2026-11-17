@@ -28,3 +28,38 @@ class NoGraph(Exception):
 
     status_code = 409
     code = "no_graph"
+
+
+class UnknownEntry(Exception):
+    """Entry service requested for monitoring is not part of the current graph."""
+
+    status_code = 404
+    code = "unknown_entry"
+
+
+class AlreadyMonitoring(Exception):
+    """An availability monitor is already running."""
+
+    status_code = 409
+    code = "already_monitoring"
+
+
+class MonitorClosed(Exception):
+    """The monitoring period was already stopped (or is otherwise unavailable)."""
+
+    status_code = 409
+    code = "monitor_closed"
+
+
+class NotMonitoring(Exception):
+    """No availability monitor is running."""
+
+    status_code = 409
+    code = "not_monitoring"
+
+
+class InvalidUntil(Exception):
+    """The requested ``until`` cutoff is malformed or inconsistent."""
+
+    status_code = 422
+    code = "invalid_until"

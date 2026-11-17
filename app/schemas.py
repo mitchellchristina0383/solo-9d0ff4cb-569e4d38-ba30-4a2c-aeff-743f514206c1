@@ -83,3 +83,48 @@ class ReplaceResponse(BaseModel):
     service_count: int
     edge_count: int
     preserved_state: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Availability monitoring
+# ---------------------------------------------------------------------------
+
+
+class MonitorStartPayload(BaseModel):
+    entry: str = Field(
+        ..., min_length=1, description="Entry service to monitor (must be in the graph)"
+    )
+
+
+class MonitorResponse(BaseModel):
+    entry: str
+    started_at: str
+    start_revision: int
+    current_state: Literal["available", "interrupted", "unknown"]
+    already_monitoring: bool
+
+
+class AvailabilityPeriod(BaseModel):
+    state: Literal["available", "interrupted", "unknown"]
+    start: str
+    end: str
+    duration_ms: int
+    graph_revision: Optional[int]
+
+
+class AvailabilityResponse(BaseModel):
+    entry: str
+    started_at: str
+    until: str
+    graph_revision: Optional[int]
+    start_revision: int
+    available_ms: int
+    interrupted_ms: int
+    unknown_ms: int
+    total_ms: int
+    available_seconds: float
+    interrupted_seconds: float
+    unknown_seconds: float
+    total_seconds: float
+    segments: list[AvailabilityPeriod]
+    interrupted_periods: list[AvailabilityPeriod]

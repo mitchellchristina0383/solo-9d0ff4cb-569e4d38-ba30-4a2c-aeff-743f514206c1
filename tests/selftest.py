@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -454,6 +455,308 @@ def test_concurrency() -> None:
     )
 
 
+def _avail(until: str | None = None):
+    path = "/availability" + (f"?until={urllib.parse.quote(until)}" if until else "")
+    return request("GET", path)
+
+
+def _segments(body: dict) -> list[tuple[str, int]]:
+    return [(s["state"], s["duration_ms"]) for s in body["segments"]]
+
+
+def _sums_cover(body: dict) -> bool:
+    return (
+        body["available_ms"] + body["interrupted_ms"] + body["unknown_ms"]
+        == body["total_ms"]
+    )
+
+
+def _contiguous(body: dict) -> bool:
+    segs = body["segments"]
+    if not segs:
+        return True
+    if segs[0]["start"] != body["started_at"]:
+        return False
+    for a, b in zip(segs, segs[1:]):
+        if a["end"] != b["start"]:
+            return False
+    return segs[-1]["end"] == body["until"]
+
+
+def test_availability() -> None:
+    print("[T6] entry availability accounting")
+    reset()
+
+    # --- prerequisites -----------------------------------------------------
+    status, body = request("POST", "/availability", {"entry": "A"})
+    check("start without a graph -> 409 no_graph",
+          status == 409 and body["error"] == "no_graph", str(body))
+    status, body = _avail()
+    check("query without a monitor -> 409 not_monitoring",
+          status == 409 and body["error"] == "not_monitoring", str(body))
+
+    request("POST", "/graph", GRAPH_V1)
+    status, body = request("POST", "/availability", {"entry": "GHOST"})
+    check("unknown entry rejected 404",
+          status == 404 and body["error"] == "unknown_entry", str(body))
+
+    # --- start: entry itself unreported -> unknown --------------------------
+    status, body = request("POST", "/availability", {"entry": "A"})
+    check("monitor starts on A", status == 201 and body["entry"] == "A", str(body))
+    check("initial conclusion unknown while nothing reported",
+          body["current_state"] == "unknown", str(body))
+    started_at = body["started_at"]
+
+    status, body = request("POST", "/availability", {"entry": "A"})
+    check("same-entry restart is idempotent",
+          status == 201 and body["already_monitoring"] is True, str(body))
+    status, body = request("POST", "/availability", {"entry": "B"})
+    check("monitoring a different entry -> 409 already_monitoring",
+          status == 409 and body["error"] == "already_monitoring", str(body))
+
+    _, body = _avail()
+    check("only one segment after start/retry", len(body["segments"]) == 1, str(body))
+    check("initial segment is unknown",
+          _segments(body)[0][0] == "unknown", str(body))
+    check("initial segment starts at monitor start",
+          body["segments"][0]["start"] == started_at, str(body))
+
+    # --- all required reports up -> available ------------------------------
+    request("POST", "/reports", {"service": "A", "seq": 1, "status": "recover"})
+    _, body = _avail()
+    check("entry alone up is not enough (upstream missing) -> still unknown",
+          body["segments"][-1]["state"] == "unknown", str(body))
+
+    request("POST", "/reports", {"service": "B", "seq": 1, "status": "recover"})
+    request("POST", "/reports", {"service": "C", "seq": 1, "status": "recover"})
+    _, body = _avail()
+    check("A,B,C up but D unreported -> unknown",
+          body["segments"][-1]["state"] == "unknown", str(body))
+
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "recover"})
+    _, body = _avail()
+    states = [s for s, _ in _segments(body)]
+    check("entry + full upstream closure healthy -> available",
+          states == ["unknown", "available"], str(states))
+    check("durations sum to the full interval", _sums_cover(body), str(body))
+    check("segments are contiguous over the whole interval",
+          _contiguous(body), str(body))
+
+    # --- retries / rejects / no-op updates never add a segment ------------
+    before = len(body["segments"])
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "recover"})
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "recover"})
+    _, body = _avail()
+    check("idempotent retry / 409 conflict add no segment",
+          len(body["segments"]) == before, str(body))
+    check("still available after retries",
+          body["segments"][-1]["state"] == "available", str(body))
+
+    # A committed report that does not change the conclusion adds no segment
+    # either: Y is unrelated to entry A.
+    request("POST", "/reports", {"service": "Y", "seq": 1, "status": "fault"})
+    _, body = _avail()
+    check("unrelated committed fault adds no segment",
+          len(body["segments"]) == before and body["segments"][-1]["state"] == "available",
+          str(body))
+
+    # --- upstream fault -> interrupted; recovery -> available -------------
+    request("POST", "/reports", {"service": "D", "seq": 2, "status": "fault"})
+    _, body = _avail()
+    check("faulty upstream D interrupts the entry",
+          body["segments"][-1]["state"] == "interrupted", str(body))
+    check("interrupted period has start < end and a duration",
+          len(body["interrupted_periods"]) == 1
+          and body["interrupted_periods"][0]["duration_ms"] > 0
+          and body["interrupted_periods"][0]["start"]
+          < body["interrupted_periods"][0]["end"],
+          str(body))
+    check("durations still sum after a split", _sums_cover(body), str(body))
+    interrupted_count = len(body["segments"])
+
+    # A committed report that does not change the conclusion adds no segment:
+    # the entry is already interrupted through D.
+    request("POST", "/reports", {"service": "A", "seq": 2, "status": "fault"})
+    _, body = _avail()
+    check("entry fault while already interrupted adds no segment",
+          len(body["segments"]) == interrupted_count
+          and body["segments"][-1]["state"] == "interrupted", str(body))
+    request("POST", "/reports", {"service": "A", "seq": 3, "status": "recover"})
+    _, body = _avail()
+    check("entry recovery leaves D's fault still interrupting, no segment",
+          len(body["segments"]) == interrupted_count
+          and body["segments"][-1]["state"] == "interrupted", str(body))
+
+    request("POST", "/reports", {"service": "D", "seq": 3, "status": "recover"})
+    _, body = _avail()
+    check("all relevant healthy again -> available",
+          body["segments"][-1]["state"] == "available", str(body))
+
+    # A second, separate interruption is recorded as its own period.
+    request("POST", "/reports", {"service": "D", "seq": 4, "status": "fault"})
+    request("POST", "/reports", {"service": "D", "seq": 5, "status": "recover"})
+    _, body = _avail()
+    check("second interruption recorded as a separate period",
+          len(body["interrupted_periods"]) == 2, str(body))
+    check("interrupted periods are exactly the interrupted segments",
+          [(p["start"], p["end"]) for p in body["interrupted_periods"]]
+          == [(s["start"], s["end"]) for s in body["segments"] if s["state"] == "interrupted"],
+          str(body))
+    check("interrupted periods do not overlap",
+          all(a["end"] <= b["start"]
+              for a, b in zip(body["interrupted_periods"],
+                              body["interrupted_periods"][1:])),
+          str(body))
+    check("interrupted total equals the sum of period durations",
+          body["interrupted_ms"]
+          == sum(p["duration_ms"] for p in body["interrupted_periods"]),
+          str(body))
+
+    # --- graph change: closure change splits; same topology does not ------
+    n = len(body["segments"])
+    request("POST", "/graph", {
+        "version": "v1-same-topology",
+        "services": GRAPH_V1["services"],
+    })
+    _, body = _avail()
+    check("topology-preserving graph recommit adds no segment",
+          len(body["segments"]) == n, str(body))
+
+    request("POST", "/reports", {"service": "X", "seq": 1, "status": "fault"})
+    _, body = _avail()
+    check("fault on a node outside A's closure does not interrupt A",
+          body["segments"][-1]["state"] == "available", str(body))
+
+    # v2' makes A depend on X, which is faulted -> interrupted.
+    status, committed = request("POST", "/graph", {
+        "version": "v2-entry-watch",
+        "services": [
+            {"name": "A", "dependencies": ["B", "C", "X"]},
+            {"name": "B", "dependencies": ["D"]},
+            {"name": "C", "dependencies": ["D"]},
+            {"name": "D", "dependencies": []},
+            {"name": "X", "dependencies": ["Y"]},
+            {"name": "Y", "dependencies": []},
+        ],
+    })
+    _, body = _avail()
+    check("graph change that adds a faulted upstream interrupts the entry",
+          body["segments"][-1]["state"] == "interrupted", str(body))
+    check("split segment records the new graph revision",
+          body["segments"][-1]["graph_revision"] == committed["revision"], str(body))
+
+    # Removing the entry from the graph makes the conclusion unknown.
+    request("POST", "/graph", {
+        "version": "v3-entry-gone",
+        "services": [{"name": "B", "dependencies": []}],
+    })
+    _, body = _avail()
+    check("entry removed from the graph -> unknown",
+          body["segments"][-1]["state"] == "unknown", str(body))
+
+    # --- restarts / persistence -------------------------------------------
+    # (A server restart cannot be done from this script; the timeline is
+    #  stored in SQLite and re-read on every query, verified by the fact that
+    #  every check above re-reads it from the database with no in-process
+    #  state involved.)
+
+    # --- cutoff ------------------------------------------------------------
+    status, body = _avail("2000-01-01T00:00:00Z")
+    check("until before monitor start -> 422 invalid_until",
+          status == 422 and body["error"] == "invalid_until", str(body))
+    status, body = _avail("not-a-timestamp")
+    check("malformed until -> 422 invalid_until",
+          status == 422 and body["error"] == "invalid_until", str(body))
+    _, current = _avail()
+    _, past = _avail(current["until"])
+    check("until equal to the current cutoff reproduces the same totals",
+          (past["available_ms"], past["interrupted_ms"], past["unknown_ms"])
+          == (current["available_ms"], current["interrupted_ms"], current["unknown_ms"]),
+          f"{past} vs {current}")
+    check("open segment is counted up to the query cutoff",
+          past["segments"][-1]["end"] == current["until"]
+          and past["total_ms"] == current["total_ms"], str(past))
+
+    # --- stop finalizes and retains the accounting ------------------------
+    status, stopped = request("DELETE", "/availability")
+    check("stop returns the finalized summary", status == 200, str(stopped))
+    check("stopped summary sums to the whole interval",
+          _sums_cover(stopped), str(stopped))
+    check("final open segment is closed at the stop cutoff",
+          stopped["segments"][-1]["end"] == stopped["until"], str(stopped))
+    check("summaries reference the same accounting period",
+          stopped["started_at"] == started_at, str(stopped))
+    check("until is monotonically after the start",
+          stopped["until"] > stopped["started_at"], str(stopped))
+    status, body = request("DELETE", "/availability")
+    check("stopping twice -> 409 monitor_closed",
+          status == 409 and body["error"] == "monitor_closed", str(body))
+
+    # The finalized accounting survives later reports untouched.
+    request("POST", "/reports", {"service": "A", "seq": 9, "status": "fault"})
+    status, reread = _avail()
+    check("query after stop still returns the finalized timeline", status == 200,
+          str(reread))
+    check("later reports do not extend a stopped timeline",
+          reread["until"] == stopped["until"]
+          and (reread["available_ms"], reread["interrupted_ms"],
+               reread["unknown_ms"])
+          == (stopped["available_ms"], stopped["interrupted_ms"],
+              stopped["unknown_ms"]),
+          str(reread))
+
+    # A second monitor for the same process is rejected: one accounting
+    # period per dataset, cleared by /admin/reset.
+    status, body = request("POST", "/availability", {"entry": "B"})
+    check("a finished accounting period cannot be restarted",
+          status == 409 and body["error"] == "monitor_closed", str(body))
+
+    # After a reset a fresh monitor starts a brand-new timeline.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    status, body = request("POST", "/availability", {"entry": "B"})
+    check("new monitor can start after reset", status == 201, str(body))
+    _, body = _avail()
+    check("new monitor has a fresh single-segment timeline",
+          len(body["segments"]) == 1 and body["segments"][0]["start"] == body["started_at"],
+          str(body))
+    request("DELETE", "/availability")
+
+    # --- concurrent queries during reports --------------------------------
+    reset()
+    request("POST", "/graph", {
+        "services": [
+            {"name": "A", "dependencies": ["B"]},
+            {"name": "B", "dependencies": []},
+        ]
+    })
+    request("POST", "/availability", {"entry": "A"})
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        writers = [
+            pool.submit(request, "POST", "/reports",
+                        {"service": "B", "seq": i,
+                         "status": "fault" if i % 2 else "recover"})
+            for i in range(1, 31)
+        ]
+        readers = [pool.submit(_avail) for _ in range(60)]
+        writer_results = [f.result() for f in writers]
+        read_results = [f.result() for f in readers]
+    check("concurrent reports only 200/409",
+          all(st in (200, 409) for st, _ in writer_results), str(writer_results))
+    bad = []
+    for st, body in read_results:
+        if st != 200:
+            bad.append((st, body))
+            continue
+        if not _sums_cover(body) or not _contiguous(body):
+            bad.append(("inconsistent", body))
+    check("every concurrent availability read is one consistent committed snapshot",
+          not bad, str(bad[:2]))
+    status, _ = request("DELETE", "/availability")
+    check("monitor can be stopped after the concurrent burst", status == 200)
+
+
 def main() -> int:
     print(f"Self-test against {BASE_URL}\n")
     try:
@@ -467,6 +770,7 @@ def main() -> int:
     test_suppression()
     test_graph_replace_preserves_state()
     test_concurrency()
+    test_availability()
 
     print(f"\n{'-' * 60}\nPASS={PASS} FAIL={FAIL}")
     if FAIL:

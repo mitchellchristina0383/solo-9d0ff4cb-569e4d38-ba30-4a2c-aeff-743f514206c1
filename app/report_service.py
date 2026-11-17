@@ -1,6 +1,7 @@
 """Fault/recovery report processing with per-service monotonic sequence numbers."""
 from __future__ import annotations
 
+from .availability import record_conclusion
 from .database import write_tx
 from .errors import ReportConflict, UnknownService
 from .schemas import ReportPayload
@@ -69,6 +70,12 @@ def submit_report(payload: ReportPayload) -> dict:
             "INSERT INTO events (service, seq, status, applied) VALUES (?, ?, ?, ?)",
             (payload.service, payload.seq, wanted, int(applied)),
         )
+
+        # Split the entry-availability timeline if -- and only if -- this
+        # committed report changes the conclusion.  Runs in the same
+        # transaction: a timing failure rolls the report back as well.
+        if applied:
+            record_conclusion(conn)
 
     return {
         "applied": applied,

@@ -3,17 +3,31 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
+from .availability import get_availability, start_monitor, stop_monitor
 from .database import close_connection, get_connection, init_db, write_tx
-from .errors import GraphError, NoGraph, ReportConflict, UnknownService
+from .errors import (
+    AlreadyMonitoring,
+    GraphError,
+    InvalidUntil,
+    MonitorClosed,
+    NoGraph,
+    NotMonitoring,
+    ReportConflict,
+    UnknownEntry,
+    UnknownService,
+)
 from .graph_service import classify_alerts, get_graph, replace_graph
 from .report_service import submit_report
 from .schemas import (
     AlertsResponse,
+    AvailabilityResponse,
     GraphPayload,
     GraphResponse,
+    MonitorResponse,
+    MonitorStartPayload,
     ReplaceResponse,
     ReportPayload,
     ReportResponse,
@@ -79,6 +93,46 @@ async def _no_graph(_: Request, exc: NoGraph):
     )
 
 
+@app.exception_handler(UnknownEntry)
+async def _unknown_entry(_: Request, exc: UnknownEntry):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
+@app.exception_handler(AlreadyMonitoring)
+async def _already_monitoring(_: Request, exc: AlreadyMonitoring):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
+@app.exception_handler(NotMonitoring)
+async def _not_monitoring(_: Request, exc: NotMonitoring):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
+@app.exception_handler(InvalidUntil)
+async def _invalid_until(_: Request, exc: InvalidUntil):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
+@app.exception_handler(MonitorClosed)
+async def _monitor_closed(_: Request, exc: MonitorClosed):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
 @app.post("/graph", response_model=ReplaceResponse, status_code=200)
 def put_graph(payload: GraphPayload) -> ReplaceResponse:
     """Replace the **whole** dependency graph.
@@ -108,6 +162,35 @@ def read_alerts() -> AlertsResponse:
     return AlertsResponse(**classify_alerts())
 
 
+@app.post("/availability", response_model=MonitorResponse, status_code=201)
+def begin_availability_monitor(payload: MonitorStartPayload) -> MonitorResponse:
+    """Start monitoring availability of an entry in the current graph.
+
+    The entry must be a node of the currently committed graph.  Retrying with
+    the same entry is idempotent and creates no new segment.  Use
+    ``POST /admin/reset`` (or ``DELETE /availability``) to stop a monitor.
+    """
+    return MonitorResponse(**start_monitor(payload.entry))
+
+
+@app.get("/availability", response_model=AvailabilityResponse)
+def read_availability(
+    until: str | None = Query(
+        default=None,
+        description="Optional UTC ISO-8601 cutoff (e.g. 2026-11-17T12:00:00Z); "
+        "defaults to the query's commit time",
+    )
+) -> AvailabilityResponse:
+    """Return available / interrupted / unknown durations and interrupted periods."""
+    return AvailabilityResponse(**get_availability(until))
+
+
+@app.delete("/availability", response_model=AvailabilityResponse)
+def delete_availability_monitor() -> AvailabilityResponse:
+    """Stop monitoring and return the final summary of the monitored interval."""
+    return AvailabilityResponse(**stop_monitor())
+
+
 @app.post("/admin/reset", status_code=200)
 def admin_reset() -> dict:
     """Clear all data (test/operations helper)."""
@@ -117,6 +200,8 @@ def admin_reset() -> dict:
         conn.execute("DELETE FROM edges")
         conn.execute("DELETE FROM nodes")
         conn.execute("DELETE FROM graph_meta")
+        conn.execute("DELETE FROM availability_segment")
+        conn.execute("DELETE FROM availability_monitor")
     return {"reset": True}
 
 
